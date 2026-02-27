@@ -1,0 +1,48 @@
+data:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  vintage_start: 2010
+  vintage_end: 2015
+
+features:
+  categorical:
+    - property_type
+    - occupancy_status
+    - channel
+    - state
+  numeric:
+    - orig_ltv
+    - orig_upb
+    - orig_interest_rate
+    - orig_term
+    - ltv_at_default
+    - months_delinquent_at_default
+    - hpi_change
+    - unemployment_rate_at_default
+  target: loss_given_default
+
+training:
+  test_size: 0.15
+  val_size: 0.15
+  random_seed: 42
+  stratify_by: vintage_year
+
+model:
+  hidden_dims: [256, 128, 64]
+  dropout: 0.3
+  batch_size: 512
+  max_epochs: 100
+  patience: 10
+  learning_rate: 0.001
+  tail_loss_alpha: 2.0
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: lgd-prediction
+
+api:
+  model_path: models/lgd_model.pt
+  db_path: api/predictions.db
+  host: 0.0.0.0
+  port: 8000

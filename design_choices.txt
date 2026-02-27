@@ -1,0 +1,82 @@
+# Design Choices
+## Credit Risk: Loss Given Default (LGD) Prediction
+
+This document records the reasoning behind decisions that were deliberate rather than default — choices where a reasonable practitioner might have gone a different direction, and where the rationale is worth making explicit.
+
+---
+
+### Conditional Model: Predicting LGD Given Default, Not Joint PD and LGD
+
+The model predicts LGD conditional on default having already occurred. It does not predict probability of default, and it does not attempt to model both quantities jointly.
+
+The joint approach has surface appeal — a single model that predicts expected loss end-to-end is conceptually cleaner — but it conflates two problems that are driven by different mechanics and benefit from different feature sets. Probability of default is primarily a function of borrower financial health, debt service capacity, and economic conditions at origination and over the life of the loan. LGD, by contrast, is primarily a function of collateral value at the time of default and the efficiency of the resolution process. Forcing a single model to learn both relationships simultaneously means the model has to find a feature representation that serves neither problem optimally.
+
+There is also a practical consideration. The population of defaulted loans is a small, non-random subset of all originated loans, and the features most predictive of LGD — particularly LTV at default and months delinquent at default — are not observable for performing loans. A joint model trained on all originated loans would have to handle substantial missing data for these features or proxy them in ways that introduce noise. The conditional model sidesteps this by restricting the training population to loans where those features are directly observed.
+
+The tradeoff is that this model cannot be used in isolation to compute expected loss (EL = PD × LGD × EAD). It requires a separate PD model, and combining the two introduces its own modeling and calibration questions. That is a real limitation and is documented in the model card. For the use cases this project targets — CECL reserve estimation for known delinquencies and stress testing of existing default pipelines — the conditional framing is the operationally appropriate one.
+
+---
+
+### Loss Function: Weighted MSE Over Standard MSE
+
+Standard mean squared error treats all prediction errors equivalently, weighted only by their magnitude. For LGD, that is the wrong objective. The empirical distribution of LGD is bimodal, with a meaningful spike at zero (loans that default but recover fully, often through short sale or deed-in-lieu) and a spike near one (loans that go to foreclosure with severe collateral impairment). Standard MSE on a bimodal target underweights errors in the tails, because tail observations are relatively rare and their squared errors do not dominate the training signal.
+
+The loss function used here applies higher weights to errors on observations where realized LGD is below 0.10 or above 0.85, reflecting the fact that tail misclassification is more consequential for provisioning purposes than errors in the middle of the distribution. A loan predicted at LGD = 0.40 that resolves at LGD = 0.50 is a $100K error on a $1M loan. A loan predicted at LGD = 0.20 that resolves at LGD = 0.95 is a $750K error on the same loan, and it represents a failure to flag a severe loss event that provisioning models need to capture.
+
+An alternative approach considered was Beta regression loss, which is natural for targets bounded in (0, 1) and handles the bimodal distribution more formally. Beta regression was not adopted for this iteration because it requires that neither 0 nor 1 appear as realized values, which is not true of this dataset — some loans do recover exactly 100% or lose exactly 100% of outstanding balance. Transforming the target to avoid boundary values introduces its own assumptions. Weighted MSE with the Sigmoid output constraint is a pragmatic choice that handles the boundary values directly while still shifting the training signal toward tail accuracy.
+
+---
+
+### PyTorch MLP Alongside Gradient Boosting, Not Instead of It
+
+Gradient boosting — XGBoost or LightGBM — typically outperforms neural networks on tabular data, and there is substantial published evidence for this. Choosing PyTorch for the primary model therefore requires justification rather than assumption.
+
+The decision was not to replace gradient boosting with PyTorch but to build both and compare them honestly. The baseline section of this project trains Ridge Regression and a Gradient Boosting model before the PyTorch MLP is introduced. If GBM outperforms LGDNet on the test set, that finding is reported as a result, not buried. The success criteria document makes this explicit.
+
+The case for including PyTorch at all rests on three considerations. First, the MLP architecture can learn nonlinear interactions between features — particularly between macroeconomic inputs and loan-level characteristics — that GBM captures through explicit feature engineering or interaction terms. Whether those interactions matter enough to overcome GBM's typical tabular advantage is an empirical question this project is designed to answer. Second, the PyTorch model integrates naturally with SHAP's DeepExplainer, which produces theoretically grounded attribution values for neural network architectures; GBM SHAP attributions are also well-supported, so this is not a decisive factor, but it is a consideration. Third, demonstrating comfort with PyTorch model development — training loops, batch normalization, learning rate scheduling, early stopping — is a portfolio objective independent of whether the model wins the accuracy comparison.
+
+The honest expectation going in is that the models will perform comparably on this dataset, with GBM potentially holding a narrow edge. That outcome would be a legitimate and informative result.
+
+---
+
+### LTV at Default as a Feature: Addressing the Leakage Question
+
+LTV at default — the ratio of outstanding balance to current property value at the time of default — is one of the strongest predictors of LGD and is included as a primary feature. This choice requires an explicit defense because it can be confused with data leakage.
+
+Data leakage occurs when a feature encodes information about the target that would not be available at the time the model is actually used. LTV at default is not leakage in this model because the model is conditional — it is applied to loans that have already defaulted, meaning LTV at default is known and observable at the time of inference. The prediction is made after default, not before it. An institution running this model against its delinquency pipeline has the current unpaid balance from its servicing system and can obtain a current property value estimate from an AVM. Both inputs are available. The feature is legitimate.
+
+What would constitute leakage in this context is using resolution outcome features — actual net proceeds, actual foreclosure costs — as model inputs, because those are not known until the loss is realized. No such features are included.
+
+---
+
+### Vintage-Stratified Train/Test Split
+
+The training and test sets are split by origination vintage year rather than randomly. Loans originating in 2010–2013 are used for training and validation; loans originating in 2014–2015 are held out for testing.
+
+A random split would produce optimistic test set performance, because randomly allocated loans from the same vintage would share macroeconomic context — the same housing market conditions, the same interest rate environment — with training set loans. The model would be evaluated on data that is, in a meaningful sense, similar to what it trained on.
+
+The vintage-stratified split evaluates the model on out-of-sample vintages, which is a closer approximation of actual deployment conditions. When an institution uses this model operationally, it will be applying it to loans originated after the training data ends. Testing on later vintages provides a more honest estimate of generalization performance, even if it produces a lower R² than a random split would. A model evaluated on a vintage-stratified holdout that achieves R² of 0.28 is more credible than one evaluated on a random holdout that achieves R² of 0.38, because the latter may be capturing vintage-specific patterns rather than generalizable LGD drivers.
+
+---
+
+### Sigmoid Output Constraint
+
+The final layer of LGDNet applies a Sigmoid activation, constraining all predictions to the interval (0, 1). This is a deliberate architectural choice, not a default.
+
+LGD is bounded. A value below zero is economically meaningless — it would imply the lender profited from a default — and a value above one would imply losses exceeding the outstanding balance, which is not how residential mortgage loss accounting works. A model that can produce out-of-range predictions is producing outputs that require post-processing correction before they can be used, which is operationally inconvenient and creates edge cases that have to be handled explicitly in downstream systems.
+
+The Sigmoid constraint builds the bounds into the architecture rather than patching them afterward. The tradeoff is that Sigmoid saturates near the boundaries, meaning the gradients for observations with very high or very low LGD are small during training, which can slow learning for exactly the tail observations that matter most. The weighted loss function partially compensates for this by upweighting tail errors, making those observations more influential despite the gradient saturation. Whether this compensation is fully adequate is something the calibration analysis will surface.
+
+---
+
+### MAE as the Primary Evaluation Metric
+
+Mean Absolute Error is the primary metric for this project. Root Mean Squared Error is tracked but treated as secondary.
+
+RMSE penalizes large errors more than small ones by squaring the residuals before averaging. For some applications that is the right objective — if a single catastrophic prediction is worse than several moderate ones, RMSE better reflects the cost function. For CECL provisioning on a residential mortgage portfolio, the relevant question is how accurate the model is on average across all defaulted loans, because provisioning operates at the portfolio level. Reserve adequacy depends on whether the total predicted loss across the portfolio is close to total realized loss, which is a function of average error rather than squared error.
+
+The dollar interpretation of MAE is also more communicable in business contexts. A MAE of 8% on a portfolio with average UPB at default of $200K translates to an average reserve error of $16K per loan. That is a number a CFO or chief risk officer can reason about. An RMSE of 12% requires more explanation to connect to a dollar consequence, because its interpretation depends on the shape of the error distribution.
+
+---
+
+*Document version 1.0 — internal reference, included in public repository as evidence of design discipline*
