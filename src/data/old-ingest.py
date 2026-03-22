@@ -26,18 +26,6 @@ downstream is not necessary for LGD modeling, which is a conditional model
 that operates only on loans that reached default. Filtering early reduces memory
 pressure significantly and keeps the interim files to a tractable size.
 
-Column schemas were verified against FreddieMac_SFH_file_layout.xlsx, the
-official Freddie Mac data dictionary for the SFLP dataset. Both files contain
-32 pipe-delimited fields. The layout was confirmed against that source; do not
-modify these column lists without re-checking the Excel file.
-
-Key performance file positions for LGD target construction:
-  position  9 = zero_balance_code     — resolution type (02/03/06/09 = default)
-  position 14 = mi_recoveries         — mortgage insurance recoveries at resolution
-  position 15 = net_sale_proceeds     — net proceeds from property sale
-  position 17 = expenses              — total expenses at resolution
-  position 22 = actual_loss           — Actual Loss Calculation (Freddie Mac pre-computed)
-
 Usage:
     python src/data/ingest.py [--config configs/default.yaml]
 """
@@ -67,81 +55,34 @@ logger = get_logger(__name__)
 #
 # These lists define the column order for the pipe-delimited flat files.
 # Freddie Mac does not include a header row — columns are positional.
-# Both schemas were verified against FreddieMac_SFH_file_layout.xlsx.
-# Each file contains 32 pipe-delimited fields.
+# The ordering here reflects the 2013+ file format documented at:
+# https://www.freddiemac.com/research/datasets/sf-loanlevel-dataset
 #
-# Misaligned columns will not raise an error at read time — they will silently
-# produce wrong values, which is the worst kind of failure.
+# If you are working with pre-2013 files, verify the column positions against
+# the corresponding data dictionary PDF, as Freddie Mac revised the schema
+# in that period. Misaligned columns will not raise an error at read time —
+# they will silently produce wrong values, which is the worst kind of failure.
 # ---------------------------------------------------------------------------
 
 ORIGINATION_COLUMNS = [
-    "credit_score",               # 1  - FICO at origination; 9999 = not available
-    "first_payment_date",         # 2  - YYYYMM; used to derive vintage_year
-    "first_time_homebuyer",       # 3  - Y/N/U
-    "maturity_date",              # 4  - YYYYMM
-    "msa",                        # 5  - Metropolitan Statistical Area code
-    "mip",                        # 6  - Mortgage Insurance Percentage
-    "num_units",                  # 7  - 1-4
-    "occupancy_status",           # 8  - P=primary, S=second home, I=investment
-    "orig_cltv",                  # 9  - Combined LTV at origination
-    "orig_dti",                   # 10 - Debt-to-income at origination
-    "orig_upb",                   # 11 - Original unpaid principal balance
-    "orig_ltv",                   # 12 - LTV at origination (primary LTV feature)
-    "orig_interest_rate",         # 13 - Note rate at origination
-    "channel",                    # 14 - R=retail, B=broker, C=correspondent, T=TPO
-    "prepayment_penalty_flag",    # 15 - Y/N
-    "amortization_type",          # 16 - FRM/ARM
-    "property_state",             # 17 - Two-letter state abbreviation
-    "property_type",              # 18 - SF/CO/CP/MH/PU
-    "postal_code",                # 19 - 5-digit ZIP (first 3 digits only in some releases)
-    "loan_seq_num",               # 20 - Primary key; joins to performance file
-    "loan_purpose",               # 21 - P=purchase, C=cash-out refi, N=no-cash refi
-    "orig_loan_term",             # 22 - 180 or 360 months
-    "num_borrowers",              # 23 - 01 or 02
-    "seller_name",                # 24 - Originating seller
-    "servicer_name",              # 25 - Current servicer
-    "super_conforming_flag",      # 26 - Y/N
-    "pre_harp_loan_seq_num",      # 27 - Loan seq of prior loan if HARP refinance
-    "program_indicator",          # 28 - 9=not applicable; H=Home Possible; etc.
-    "harp_indicator",             # 29 - Y/N; HARP (Home Affordable Refinance Program)
-    "property_valuation_method",  # 30 - 1-9; appraisal method code
-    "io_indicator",               # 31 - Y/N; interest-only flag
-    "mi_cancellation_indicator",  # 32 - Y/N; mortgage insurance cancellation indicator
+    "credit_score", "first_payment_date", "first_time_homebuyer", "maturity_date",
+    "msa", "mip", "num_units", "occupancy_status", "orig_cltv", "orig_dti",
+    "orig_upb", "orig_ltv", "orig_interest_rate", "channel", "prepayment_penalty",
+    "amortization_type", "property_state", "property_type", "postal_code",
+    "loan_seq_num", "loan_purpose", "orig_loan_term", "num_borrowers",
+    "seller_name", "servicer_name", "super_conforming_flag",
 ]
 
 PERFORMANCE_COLUMNS = [
-    "loan_seq_num",               # 1  - Foreign key to origination file
-    "monthly_reporting_period",   # 2  - YYYYMM; month this record covers
-    "current_upb",                # 3  - Current unpaid principal balance
-    "current_delinquency_status", # 4  - 0=current, 1-12=months delinquent, XX=foreclosure
-    "loan_age",                   # 5  - Months since first payment date
-    "remaining_months_to_maturity",# 6 - Remaining months to legal maturity
-    "defect_settlement_date",     # 7  - YYYYMM; date of defect settlement if applicable
-    "modification_flag",          # 8  - Y/N
-    "zero_balance_code",          # 9  - Resolution type: 02/03/06/09=default; 01=payoff
-    "zero_balance_effective_date",# 10 - YYYYMM; date loan balance went to zero
-    "current_interest_rate",      # 11 - Interest rate at time of record
-    "current_deferred_upb",       # 12 - Deferred UPB from modification
-    "ddlpi",                      # 13 - Due date of last paid installment (YYYYMM)
-    "mi_recoveries",              # 14 - Mortgage insurance recoveries at resolution
-    "net_sale_proceeds",          # 15 - Net proceeds from property sale at resolution
-    "non_mi_recoveries",          # 16 - Non-MI recoveries at resolution
-    "expenses",                   # 17 - Total expenses at resolution
-    "legal_costs",                # 18 - Legal costs at resolution
-    "maintenance_costs",          # 19 - Property maintenance and preservation costs
-    "taxes_insurance",            # 20 - Taxes and insurance costs
-    "misc_expenses",              # 21 - Miscellaneous expenses
-    "actual_loss",                # 22 - Actual Loss Calculation; primary LGD input
-    "modification_cost",          # 23 - Cost of loan modification if applicable
-    "step_modification_flag",     # 24 - Y/N
-    "deferred_payment_plan",      # 25 - Y/N
-    "estimated_ltv",              # 26 - Estimated LTV at time of record
-    "zero_balance_removal_upb",   # 27 - UPB at time of zero balance event
-    "delinquent_accrued_interest",# 28 - Accrued interest at time of delinquency
-    "delinquency_due_to_disaster",# 29 - Y/N; disaster-related delinquency flag
-    "borrower_assistance_status", # 30 - Borrower assistance status code
-    "current_month_modification_cost", # 31 - Modification cost in current month
-    "interest_bearing_upb",       # 32 - Interest-bearing UPB
+    "loan_seq_num", "monthly_reporting_period", "current_upb", "loan_age",
+    "remaining_months", "adj_months_to_maturity", "maturity_date", "msa",
+    "current_delinquency_status", "modification_flag", "zero_balance_code",
+    "zero_balance_effective_date", "last_paid_installment_date", "foreclosure_date",
+    "disposition_date", "foreclosure_costs", "property_preservation_costs",
+    "asset_recovery_costs", "misc_holding_expenses", "associated_taxes",
+    "net_sale_proceeds", "credit_enhancement_proceeds", "repurchase_make_whole",
+    "other_foreclosure_proceeds", "non_mi_recovery", "net_recovery",
+    "net_loss", "modification_flag_2",
 ]
 
 # The zero_balance_code values that indicate a default or loss event.
@@ -172,8 +113,8 @@ REQUIRED_ORIGINATION_COLS = {
 
 REQUIRED_PERFORMANCE_COLS = {
     "loan_seq_num", "monthly_reporting_period", "current_upb",
-    "zero_balance_code", "actual_loss", "mi_recoveries",
-    "net_sale_proceeds", "expenses",
+    "zero_balance_code", "net_loss", "foreclosure_costs",
+    "credit_enhancement_proceeds",
 }
 
 
@@ -467,5 +408,3 @@ if __name__ == "__main__":
     parser.add_argument("--config", default=None, help="Path to config YAML")
     args = parser.parse_args()
     main(args.config)
-
-

@@ -86,18 +86,23 @@ ORIGINATION_CATEGORICAL = [
 PERFORMANCE_NUMERIC = {
     "current_upb": float,
     "loan_age": float,
-    "foreclosure_costs": float,
-    "property_preservation_costs": float,
-    "asset_recovery_costs": float,
-    "misc_holding_expenses": float,
-    "associated_taxes": float,
+    "current_interest_rate": float,
+    "current_deferred_upb": float,
+    "mi_recoveries": float,
     "net_sale_proceeds": float,
-    "credit_enhancement_proceeds": float,
-    "repurchase_make_whole": float,
-    "other_foreclosure_proceeds": float,
-    "non_mi_recovery": float,
-    "net_recovery": float,
-    "net_loss": float,
+    "non_mi_recoveries": float,
+    "expenses": float,
+    "legal_costs": float,
+    "maintenance_costs": float,
+    "taxes_insurance": float,
+    "misc_expenses": float,
+    "actual_loss": float,
+    "modification_cost": float,
+    "estimated_ltv": float,
+    "zero_balance_removal_upb": float,
+    "delinquent_accrued_interest": float,
+    "current_month_modification_cost": float,
+    "interest_bearing_upb": float,
 }
 
 
@@ -130,11 +135,11 @@ def _impute_missing(df: pd.DataFrame) -> pd.DataFrame:
     actually means in the context of residential mortgage data, rather than
     applying a uniform statistical approach. The rationale for each choice:
 
-    Cost fields (foreclosure_costs, property_preservation_costs, etc.) are
-    filled with 0 because a missing value in these fields means no cost was
-    incurred, not that the cost is unknown. Freddie Mac populates these fields
-    when costs exist; absence of a value is absence of the cost. Imputing with
-    0 correctly represents that.
+    Cost and recovery fields (expenses, legal_costs, maintenance_costs,
+    mi_recoveries, etc.) are filled with 0 because a missing value means no
+    cost was incurred or no recovery was received, not that the amount is
+    unknown. Freddie Mac populates these fields when amounts exist; absence
+    of a value is absence of the amount. Imputing with 0 correctly represents that.
 
     mip (mortgage insurance premium) follows the same logic. When mip is
     missing, the loan has no mortgage insurance — it is a meaningful absence,
@@ -161,13 +166,15 @@ def _impute_missing(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # Zero-fill for cost fields where missing = no cost incurred.
+    # Zero-fill for cost and recovery fields where missing = no amount incurred.
     # This is the conservative and correct interpretation of Freddie Mac's
-    # field population conventions.
+    # field population conventions — these fields are populated only when a
+    # cost or recovery exists; absence of a value means zero dollars.
     numeric_zero_fill = [
-        "mip", "foreclosure_costs", "property_preservation_costs",
-        "asset_recovery_costs", "misc_holding_expenses", "associated_taxes",
-        "non_mi_recovery", "repurchase_make_whole", "other_foreclosure_proceeds",
+        "mip", "expenses", "legal_costs", "maintenance_costs",
+        "taxes_insurance", "misc_expenses", "modification_cost",
+        "mi_recoveries", "non_mi_recoveries", "delinquent_accrued_interest",
+        "current_month_modification_cost",
     ]
     for col in numeric_zero_fill:
         if col in df.columns:
@@ -243,45 +250,50 @@ def construct_lgd_target(perf_df: pd.DataFrame) -> pd.DataFrame:
     """
     df = perf_df.copy()
 
-    upb = df["current_upb"].replace(0, np.nan)
+    # Use zero_balance_removal_upb (pos 27) as the UPB at default denominator.
+    # current_upb (pos 3) is always 0 on the resolution record — it is zeroed
+    # when Freddie Mac closes out the loan. zero_balance_removal_upb is the UPB
+    # at the time the balance went to zero, which is the correct Basel III
+    # denominator for LGD = Net Loss / UPB at Default.
+    upb = df["zero_balance_removal_upb"].replace(0, np.nan)
     valid_mask = upb.notna() & (upb > 0)
 
     dropped = (~valid_mask).sum()
     if dropped > 0:
-        # This is a warning rather than an error because a small number of
-        # zero-UPB records is not unusual in the Freddie Mac data — they
-        # typically represent loans with reporting errors or edge cases in
-        # the servicing transfer process. A large number would indicate a
-        # more systemic issue worth investigating.
         logger.warning(f"Dropping {dropped:,} rows with zero/null UPB (unresolvable LGD denominator)")
     df = df[valid_mask].copy()
 
-    # Prefer component-level calculation over the pre-computed net_loss field
+    # Prefer component-level calculation over the pre-computed actual_loss field
     # because it is transparent, auditable, and consistent with the formula
-    # documented in the model card. The net_loss field is used as a fallback
-    # when the individual components are not all present.
+    # documented in the model card. actual_loss is used as a fallback when
+    # the individual components are not all present.
+    #
+    # Column mapping from FreddieMac_SFH_file_layout.xlsx:
+    #   expenses (pos 17)        — total expenses at resolution
+    #   net_sale_proceeds (pos 15) — net proceeds from property sale
+    #   mi_recoveries (pos 14)   — mortgage insurance recoveries
     has_components = all(
-        c in df.columns for c in ["foreclosure_costs", "net_sale_proceeds", "credit_enhancement_proceeds"]
+        c in df.columns for c in ["expenses", "net_sale_proceeds", "mi_recoveries"]
     )
 
     if has_components:
-        foreclosure_costs = df["foreclosure_costs"].fillna(0)
+        foreclosure_costs = df["expenses"].fillna(0)
         net_proceeds = df["net_sale_proceeds"].fillna(0)
-        # credit_enhancement_proceeds captures mortgage insurance (MI) payouts
-        # and other credit enhancements that reduce the lender's net loss.
-        # Subtracting MI recovery from the numerator correctly reflects that
-        # MI payments reduce the economic loss even though they are proceeds
-        # rather than a reduction in costs.
-        mi_recovery = df["credit_enhancement_proceeds"].fillna(0)
-        upb_at_default = df["current_upb"]
+        # mi_recoveries captures mortgage insurance payouts that reduce the
+        # lender's net loss. Subtracting MI recovery from the numerator correctly
+        # reflects that MI payments reduce the economic loss even though they
+        # are proceeds rather than a reduction in costs.
+        mi_recovery = df["mi_recoveries"].fillna(0)
+        upb_at_default = df["zero_balance_removal_upb"]
         net_loss = upb_at_default - net_proceeds + foreclosure_costs - mi_recovery
     else:
-        # Freddie Mac pre-computes net_loss in the performance file. Use it
-        # when the individual components are not all available, with a note
-        # that the calculation is not directly verifiable from this path.
-        net_loss = df["net_loss"].fillna(0)
+        # Freddie Mac pre-computes the net loss in the actual_loss field
+        # (position 22, "Actual Loss Calculation"). Use it when the individual
+        # components are not all available, with a note that the calculation
+        # is not directly verifiable from this path.
+        net_loss = df["actual_loss"].fillna(0)
 
-    lgd = net_loss / df["current_upb"]
+    lgd = net_loss / df["zero_balance_removal_upb"]
     # Clip to [0, 1] as documented above. The clipping does not drop extreme
     # observations — it bounds them, which preserves the training distribution
     # shape while preventing numerically unstable targets.

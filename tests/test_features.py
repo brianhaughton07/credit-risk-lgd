@@ -92,20 +92,25 @@ def sample_origination_df():
 def sample_performance_df():
     """Minimal performance DataFrame with three clean defaults and one edge case.
 
-    A001: Standard third-party sale with moderate recovery (net_loss / UPB ≈ 0.20).
-    A002: Short sale with MI recovery, producing moderate LGD after deducting MI proceeds.
-    A003: REO disposition with full recovery (net_loss=0) — a valid LGD=0 case.
-    A004: Zero UPB — this row should be filtered out by construct_lgd_target because
-          LGD = Net Loss / UPB is undefined when UPB = 0.
+    A001: Standard third-party sale — LGD = (180k - 149k + 5k - 0) / 180k ≈ 0.20.
+    A002: Short sale with MI recovery — LGD = (290k - 240k + 8k - 2k) / 290k ≈ 0.19.
+    A003: REO disposition with full recovery — LGD = (140k - 142k + 2k) / 140k = 0.0.
+    A004: Zero zero_balance_removal_upb — filtered out (LGD denominator undefined).
+
+    current_upb is set to 0 for all rows. This reflects real Freddie Mac resolution
+    records, where the current UPB is zeroed at the time the loan closes. The LGD
+    denominator must come from zero_balance_removal_upb (the UPB at time of default),
+    not current_upb. This is the exact condition that caused the preprocess step to
+    silently drop all 38k loans — see regression test below.
     """
     return pd.DataFrame({
         "loan_seq_num": ["A001", "A002", "A003", "A004"],
-        "current_upb": [180_000.0, 290_000.0, 140_000.0, 0.0],
+        "current_upb": [0.0, 0.0, 0.0, 0.0],
+        "zero_balance_removal_upb": [180_000.0, 290_000.0, 140_000.0, 0.0],
         "zero_balance_code": ["02", "03", "09", "02"],
-        "net_loss": [36_000.0, 58_000.0, 0.0, 50_000.0],
-        "foreclosure_costs": [5_000.0, 8_000.0, 2_000.0, 3_000.0],
         "net_sale_proceeds": [149_000.0, 240_000.0, 142_000.0, 200_000.0],
-        "credit_enhancement_proceeds": [0.0, 2_000.0, 0.0, 0.0],
+        "expenses": [5_000.0, 8_000.0, 2_000.0, 3_000.0],
+        "mi_recoveries": [0.0, 2_000.0, 0.0, 0.0],
     })
 
 
@@ -132,9 +137,9 @@ class TestLGDTargetConstruction:
         )
 
     def test_lgd_zero_upb_rows_dropped(self, sample_performance_df):
-        """Rows with UPB == 0 must be excluded because the LGD denominator is zero."""
+        """Rows with zero_balance_removal_upb == 0 must be excluded (LGD denominator undefined)."""
         df = construct_lgd_target(sample_performance_df)
-        # A004 had current_upb=0 — it must not appear in the output.
+        # A004 had zero_balance_removal_upb=0 — it must not appear in the output.
         assert len(df) == 3
         assert "A004" not in df["loan_seq_num"].values
 
@@ -147,12 +152,12 @@ class TestLGDTargetConstruction:
         """
         df = pd.DataFrame({
             "loan_seq_num": ["B001"],
-            "current_upb": [100_000.0],
+            "current_upb": [0.0],
+            "zero_balance_removal_upb": [100_000.0],
             "zero_balance_code": ["03"],
-            "net_loss": [0.0],
-            "foreclosure_costs": [0.0],
             "net_sale_proceeds": [100_000.0],
-            "credit_enhancement_proceeds": [0.0],
+            "expenses": [0.0],
+            "mi_recoveries": [0.0],
         })
         result = construct_lgd_target(df)
         assert len(result) == 1
@@ -170,15 +175,39 @@ class TestLGDTargetConstruction:
         """
         df = pd.DataFrame({
             "loan_seq_num": ["C001"],
-            "current_upb": [100_000.0],
+            "current_upb": [0.0],
+            "zero_balance_removal_upb": [100_000.0],
             "zero_balance_code": ["02"],
-            "net_loss": [150_000.0],  # Loss exceeds UPB — should be capped at 1.0
-            "foreclosure_costs": [0.0],
             "net_sale_proceeds": [0.0],
-            "credit_enhancement_proceeds": [0.0],
+            "expenses": [150_000.0],  # costs exceed UPB — net_loss > 1, should cap at 1.0
+            "mi_recoveries": [0.0],
         })
         result = construct_lgd_target(df)
         assert result["loss_given_default"].iloc[0] == pytest.approx(1.0, abs=1e-6)
+
+    def test_lgd_uses_removal_upb_not_current_upb(self):
+        """Regression: current_upb=0 on all resolution records must not drop all loans.
+
+        In Freddie Mac SFLP performance files, current_upb is zeroed on the resolution
+        record (the row where zero_balance_code is populated). Using current_upb as the
+        LGD denominator caused construct_lgd_target() to drop every single row, producing
+        '0 defaulted loans ready for next step'. The denominator must be
+        zero_balance_removal_upb, which holds the UPB at the time of default.
+        """
+        df = pd.DataFrame({
+            "loan_seq_num": ["D001", "D002"],
+            "current_upb": [0.0, 0.0],  # always zero at resolution — must NOT be used as denominator
+            "zero_balance_removal_upb": [200_000.0, 150_000.0],
+            "zero_balance_code": ["09", "02"],
+            "net_sale_proceeds": [160_000.0, 120_000.0],
+            "expenses": [10_000.0, 8_000.0],
+            "mi_recoveries": [0.0, 0.0],
+        })
+        result = construct_lgd_target(df)
+        assert len(result) == 2, (
+            "All loans should survive — zero current_upb must not be used as the drop criterion"
+        )
+        assert result["loss_given_default"].between(0.0, 1.0).all()
 
 
 # ---------------------------------------------------------------------------

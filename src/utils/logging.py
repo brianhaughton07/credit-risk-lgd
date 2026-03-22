@@ -27,9 +27,27 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 from datetime import datetime, timezone
 from typing import Any
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively replace NaN/Inf floats with None so json.dumps produces valid JSON.
+
+    Python's json module serializes float('nan') as bare NaN and float('inf') as
+    Infinity — both are invalid per the JSON spec (RFC 8259) and will cause jq and
+    any strict JSON parser to fail. This sanitizer walks the object tree and replaces
+    those values with null (None) before serialization.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 
 class JSONFormatter(logging.Formatter):
@@ -76,7 +94,7 @@ class JSONFormatter(logging.Formatter):
         # to relevant log records for richer traceability.
         if hasattr(record, "extra"):
             log_obj.update(record.extra)
-        return json.dumps(log_obj)
+        return json.dumps(_sanitize_for_json(log_obj))
 
 
 def get_logger(name: str, level: int = logging.INFO, json_format: bool = True) -> logging.Logger:

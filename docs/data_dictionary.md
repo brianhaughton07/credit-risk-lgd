@@ -16,11 +16,13 @@ LGD = Net Loss / UPB at Default
 Net Loss = UPB_at_default - Net_Proceeds + Foreclosure_Costs - MI_Recovery
 
 where:
-  UPB_at_default             = current_upb at the resolution record
-  Net_Proceeds               = net_sale_proceeds (proceeds from property disposition)
-  Foreclosure_Costs          = foreclosure_costs + property_preservation_costs + other costs
-  MI_Recovery                = credit_enhancement_proceeds (mortgage insurance proceeds)
+  UPB_at_default             = current_upb (pos 3)  — UPB at the resolution record
+  Net_Proceeds               = net_sale_proceeds (pos 15) — net proceeds from property sale
+  Foreclosure_Costs          = expenses (pos 17) — total expenses at resolution
+  MI_Recovery                = mi_recoveries (pos 14) — mortgage insurance recoveries
 ```
+
+Column positions refer to the Monthly Performance Data File layout in `FreddieMac_SFH_file_layout.xlsx`. When all three component columns are present, the formula above is applied. When they are not, `actual_loss` (pos 22, "Actual Loss Calculation") is used directly as the pre-computed net loss.
 
 ---
 
@@ -86,7 +88,7 @@ where:
 | `credit_score` | Median imputation | Minority missing; median is robust to distribution shape |
 | `orig_dti` | Median imputation | Minority missing; median preferred over mean given right skew |
 | `mip` (mortgage insurance premium) | Fill with 0 | No MI is a meaningful state, not a missing observation |
-| `foreclosure_costs` and cost fields | Fill with 0 | Missing indicates no cost incurred, not unknown cost |
+| `expenses`, `legal_costs`, `maintenance_costs`, `taxes_insurance`, `misc_expenses`, `mi_recoveries`, `non_mi_recoveries` | Fill with 0 | Missing indicates no cost incurred or no recovery received, not an unknown amount |
 | `modification_flag` | Fill with 'N' | Absence of record indicates no modification |
 
 ---

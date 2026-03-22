@@ -120,11 +120,15 @@ Output: LGD ∈ [0, 1]
 git clone https://github.com/brianhaughton07/credit-risk-lgd.git
 cd credit-risk-lgd
 
-# Conda environment
-conda env create -f environment.yml
+# macOs prerequisite - required before pip install
+xcode-select --install
+brew install cmake libomp
+
+# Create and activate the environment
+conda create -n credit-risk-lgd python=3.11
 conda activate credit-risk-lgd
 
-# Or pip
+# Install dependencies
 pip install -r requirements.txt
 ```
 
